@@ -28,6 +28,9 @@ Then this script will run:
 """
 
 import argparse
+import argparse
+import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -42,6 +45,10 @@ try:
 except ImportError:
     print("❌ 'requests' required: pip install requests")
     sys.exit(1)
+
+
+__version__ = "1.1.0"
+GITHUB_REPO = "argorar/gradle-guard"
 
 
 # ─── ANSI Colors ────────────────────────────────────────────────────────────────
@@ -88,50 +95,114 @@ class Dependency:
         return f"{self.group}:{self.artifact}:{self.version}"
 
 
-# ─── Gradle Variable Resolution ────────────────────────────────────────────────
+# ─── Cache System ─────────────────────────────────────────────────────────────
+
+CACHE_PATH = os.path.expanduser("~/.gradle_guard_cache.json")
+CACHE_TTL = 86400  # 24 hours in seconds
+_cache = {"queries": {}, "details": {}}
 
 
-def resolve_version(version_str: str, variables: dict) -> Optional[str]:
-    if not version_str:
-        return None
-
-    resolved = version_str
-
-    # Handle ${varName}
-    for m in re.finditer(r"\$\{(\w+)}", version_str):
-        val = variables.get(m.group(1))
-        if val:
-            resolved = resolved.replace(m.group(0), val)
-
-    # Handle $varName
-    for m in re.finditer(r"\$(\w+)", resolved):
-        val = variables.get(m.group(1))
-        if val:
-            resolved = resolved.replace(m.group(0), val)
-
-    if "$" in resolved:
-        return None
-
-    return resolved
+def load_cache():
+    global _cache
+    if os.path.exists(CACHE_PATH):
+        try:
+            with open(CACHE_PATH, "r", encoding="utf-8") as f:
+                _cache = json.load(f)
+            if "queries" not in _cache:
+                _cache["queries"] = {}
+            if "details" not in _cache:
+                _cache["details"] = {}
+        except Exception:
+            _cache = {"queries": {}, "details": {}}
 
 
-# ─── Dependency Extraction ──────────────────────────────────────────────────────
+def save_cache():
+    try:
+        os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
+        with open(CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(_cache, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
 
-def find_all_build_files(project_path: str) -> list:
-    result = []
 
-    for root, dirs, files in os.walk(project_path):
-        dirs[:] = [
-            d for d in dirs
-            if d not in {".gradle", "build", ".git", "node_modules"}
-        ]
+def check_for_updates(force_update=False):
+    """
+    Checks GitHub for the latest release.
+    If a new version is found (or if force_update is True), prompts the user
+    to update and downloads/overwrites the current script.
+    """
+    print(f"{C.CN}🔄 Checking for updates...{C.RST}")
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 404:
+            print(f"{C.Y}⚠ No releases found on GitHub for {GITHUB_REPO} yet.{C.RST}")
+            return
+        response.raise_for_status()
+        data = response.json()
+        latest_tag = data.get("tag_name", "")
+        if not latest_tag:
+            print(f"{C.Y}⚠ No release tags found on GitHub.{C.RST}")
+            return
 
-        for f in files:
-            if f in ("build.gradle", "build.gradle.kts", "main.gradle"):
-                result.append(os.path.join(root, f))
+        latest_ver = latest_tag.lstrip("v")
+        current_ver = __version__
 
-    return result
+        try:
+            latest_parts = [int(x) for x in latest_ver.split(".")]
+            current_parts = [int(x) for x in current_ver.split(".")]
+            has_update = latest_parts > current_parts
+        except ValueError:
+            has_update = latest_ver != current_ver
 
+        if not has_update and not force_update:
+            print(f"{C.G}✅ GradleGuard is up to date (v{__version__}).{C.RST}")
+            return
+
+        if force_update:
+            print(f"{C.Y}Force update requested. Re-downloading v{latest_tag}...{C.RST}")
+        else:
+            print(f"\n{C.Y}✨ A new version is available: {C.BOLD}{latest_tag}{C.RST} (Current: v{__version__})")
+
+        # Ask user confirmation
+        confirm = input("Do you want to update now? [y/N]: ").strip().lower()
+        if confirm not in ("y", "yes"):
+            print("Update cancelled.")
+            return
+
+        # Perform update
+        raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{latest_tag}/gradle_guard.py"
+        print(f"Downloading update from {raw_url}...")
+        raw_response = requests.get(raw_url, timeout=15)
+        raw_response.raise_for_status()
+
+        script_path = os.path.abspath(__file__)
+        print(f"Overwriting {script_path}...")
+        
+        # Write new content
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(raw_response.text)
+
+        print(f"{C.G}✅ Successfully updated to {latest_tag}! Please run the script again.{C.RST}")
+        sys.exit(0)
+
+    except Exception as e:
+        print(f"{C.R}❌ Error checking/performing update: {e}{C.RST}")
+
+
+# ─── CLI Utilities ─────────────────────────────────────────────────────────────
+
+def print_progress(current: int, total: int, prefix: str = "", suffix: str = ""):
+    if total <= 0:
+        return
+    percent = int(100 * (current / total))
+    filled_length = int(30 * current // total)
+    bar = "█" * filled_length + "░" * (30 - filled_length)
+    sys.stdout.write(f"\r{prefix} |{bar}| {percent}% {suffix}")
+    sys.stdout.flush()
+    if current == total:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
 def try_gradle_dependencies(project_path: str) -> list:
     is_windows = os.name == "nt"
@@ -200,7 +271,7 @@ def get_dependencies(project_path: str) -> list:
     managed = [d for d in deps if d.version == "MANAGED"]
 
     if resolved:
-        print(f"{C.G}   ✅ {len(resolved)} dependencies with known versions{C.RST}")
+        print(f"{C.G}   ✅ {len(resolved)} dependencies resolved{C.RST}")
 
     if managed:
         print(
@@ -225,78 +296,96 @@ BATCH_SIZE = 50
 
 def query_osv_batch(deps: list) -> dict:
     results = {}
+    total = len(deps)
+    now = time.time()
 
-    for i in range(0, len(deps), BATCH_SIZE):
+    for i in range(0, total, BATCH_SIZE):
         batch = deps[i:i + BATCH_SIZE]
+        
+        # Split batch into cache hits & API queries
+        queries_to_send = []
+        for d in batch:
+            cache_key = d.full_coordinate
+            if cache_key in _cache["queries"]:
+                cache_entry = _cache["queries"][cache_key]
+                if now - cache_entry.get("timestamp", 0) < CACHE_TTL:
+                    vulns = cache_entry.get("vulns", [])
+                    if vulns:
+                        results[cache_key] = vulns
+                    continue
+            queries_to_send.append(d)
 
-        queries = [
-            {
-                "package": {
-                    "name": d.coordinate,
-                    "ecosystem": "Maven",
-                },
-                "version": d.version,
-            }
-            for d in batch
-        ]
+        if queries_to_send:
+            queries = [
+                {
+                    "package": {
+                        "name": d.coordinate,
+                        "ecosystem": "Maven",
+                    },
+                    "version": d.version,
+                }
+                for d in queries_to_send
+            ]
 
-        try:
-            resp = requests.post(
-                OSV_BATCH_URL,
-                json={"queries": queries},
-                headers={"Content-Type": "application/json"},
-                timeout=30,
-            )
-            resp.raise_for_status()
+            try:
+                resp = requests.post(
+                    OSV_BATCH_URL,
+                    json={"queries": queries},
+                    headers={"Content-Type": "application/json"},
+                    timeout=30,
+                )
+                resp.raise_for_status()
 
-            for idx, r in enumerate(resp.json().get("results", [])):
-                vulns = r.get("vulns", [])
+                for idx, r in enumerate(resp.json().get("results", [])):
+                    vulns = r.get("vulns", [])
+                    dep = queries_to_send[idx]
+                    
+                    # Update cache
+                    _cache["queries"][dep.full_coordinate] = {
+                        "timestamp": now,
+                        "vulns": vulns
+                    }
 
-                if vulns:
-                    results[batch[idx].full_coordinate] = vulns
+                    if vulns:
+                        results[dep.full_coordinate] = vulns
 
-        except requests.exceptions.RequestException as e:
-            print(f"{C.Y}   ⚠ API error: {e}{C.RST}")
-            print(f"{C.DIM}   Falling back to individual OSV queries...{C.RST}")
-
-            for d in batch:
-                try:
-                    r2 = requests.post(
-                        OSV_QUERY_URL,
-                        json={
-                            "package": {
-                                "name": d.coordinate,
-                                "ecosystem": "Maven",
+            except requests.exceptions.RequestException as e:
+                # Fallback to individual queries
+                for d in queries_to_send:
+                    try:
+                        r2 = requests.post(
+                            OSV_QUERY_URL,
+                            json={
+                                "package": {
+                                    "name": d.coordinate,
+                                    "ecosystem": "Maven",
+                                },
+                                "version": d.version,
                             },
-                            "version": d.version,
-                        },
-                        timeout=15,
-                    )
+                            timeout=15,
+                        )
 
-                    if r2.status_code == 200:
-                        vulns = r2.json().get("vulns", [])
+                        if r2.status_code == 200:
+                            vulns = r2.json().get("vulns", [])
+                            _cache["queries"][d.full_coordinate] = {
+                                "timestamp": now,
+                                "vulns": vulns
+                            }
+                            if vulns:
+                                results[d.full_coordinate] = vulns
+                    except Exception:
+                        pass
 
-                        if vulns:
-                            results[d.full_coordinate] = vulns
+        progress_val = min(i + BATCH_SIZE, total)
+        print_progress(progress_val, total, prefix=f"{C.DIM}   OSV Queries{C.RST}", suffix=f"Processed {progress_val}/{total}")
 
-                except Exception:
-                    pass
-
-        if i + BATCH_SIZE < len(deps):
+        if i + BATCH_SIZE < total and queries_to_send:
             time.sleep(0.3)
 
     return results
 
 
 def extract_fixed_versions(vuln_data: dict, pkg_name: str) -> list:
-    """
-    Extract all fixed versions reported by OSV for a Maven package.
-
-    Some libraries, like Spring, may have multiple supported release lines with
-    different fixed versions, for example:
-      - 3.5.14
-      - 4.0.6
-    """
     fixed_versions = []
 
     for affected in vuln_data.get("affected", []):
@@ -338,6 +427,12 @@ def fetch_vuln_detail(vuln_id: str) -> Optional[dict]:
     if not vuln_id:
         return None
 
+    now = time.time()
+    if vuln_id in _cache["details"]:
+        cache_entry = _cache["details"][vuln_id]
+        if now - cache_entry.get("timestamp", 0) < CACHE_TTL:
+            return cache_entry.get("data")
+
     try:
         resp = requests.get(
             f"https://api.osv.dev/v1/vulns/{vuln_id}",
@@ -345,7 +440,12 @@ def fetch_vuln_detail(vuln_id: str) -> Optional[dict]:
         )
 
         if resp.status_code == 200:
-            return resp.json()
+            data = resp.json()
+            _cache["details"][vuln_id] = {
+                "timestamp": now,
+                "data": data
+            }
+            return data
 
     except Exception:
         pass
@@ -354,15 +454,27 @@ def fetch_vuln_detail(vuln_id: str) -> Optional[dict]:
 
 
 def parse_vulns(vuln_list: list, pkg_name: str) -> list:
-    parsed = []
-
-    for v in vuln_list:
+    # Gather indexes that need full detail requests
+    to_fetch = []
+    for idx, v in enumerate(vuln_list):
         if not v.get("summary") and not v.get("details"):
-            detail = fetch_vuln_detail(v.get("id", ""))
+            to_fetch.append((idx, v.get("id", "")))
 
-            if detail:
-                v = detail
+    # Concurrently fetch detailed information using ThreadPoolExecutor
+    if to_fetch:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_idx = {
+                executor.submit(fetch_vuln_detail, vid): idx 
+                for idx, vid in to_fetch
+            }
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                detail = future.result()
+                if detail:
+                    vuln_list[idx] = detail
 
+    parsed = []
+    for v in vuln_list:
         aliases = v.get("aliases", [])
         refs = [
             r["url"]
@@ -387,12 +499,13 @@ def parse_vulns(vuln_list: list, pkg_name: str) -> list:
             )
         )
 
-        time.sleep(0.1)
-
     return parsed
 
 
-# ─── Report ─────────────────────────────────────────────────────────────────────
+
+
+
+# ─── Report & Exporters ────────────────────────────────────────────────────────
 
 SEV_COLOR = {
     "CRITICAL": C.R + C.BOLD,
@@ -541,7 +654,6 @@ def export_json(deps: list, path: str):
 
     print(f"  {C.CN}📄 JSON report: {path}{C.RST}")
 
-
 # ─── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -550,6 +662,7 @@ def main():
     )
     parser.add_argument(
         "project_path",
+        nargs="?",
         help="Path to Gradle project root.",
     )
     parser.add_argument(
@@ -557,8 +670,30 @@ def main():
         metavar="FILE",
         help="Export JSON report.",
     )
-
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Check for updates and self-update the script.",
+    )
+    parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version=f"GradleGuard v{__version__}",
+    )
     args = parser.parse_args()
+
+    # Load cache
+    load_cache()
+
+    if args.update:
+        check_for_updates()
+        sys.exit(0)
+
+    if not args.project_path:
+        parser.print_help()
+        sys.exit(1)
+
+    check_for_updates(force_update=False)
 
     project_path = os.path.abspath(os.path.expanduser(args.project_path))
 
@@ -584,6 +719,7 @@ def main():
     deps = get_dependencies(project_path)
 
     if not deps:
+        save_cache()
         sys.exit(1)
 
     print(f"\n{C.CN}{C.BOLD}🔍 Querying OSV API...{C.RST}")
@@ -591,17 +727,20 @@ def main():
 
     for dep in deps:
         raw = vuln_results.get(dep.full_coordinate, [])
-
         if raw:
             dep.vulnerabilities = parse_vulns(raw, dep.coordinate)
 
     vc = sum(1 for d in deps if d.vulnerabilities)
-    print(f"{C.G}   ✅ Done. {vc} vulnerable dependencies.{C.RST}")
+    print(f"{C.G}   ✅ Done. {vc} vulnerable dependencies identified.{C.RST}")
 
+    # Output Reports
     print_report(deps)
 
     if args.json:
         export_json(deps, args.json)
+
+    # Save Cache
+    save_cache()
 
 
 if __name__ == "__main__":
