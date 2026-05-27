@@ -28,8 +28,6 @@ Then this script will run:
 """
 
 import argparse
-import argparse
-import argparse
 import concurrent.futures
 import json
 import os
@@ -37,6 +35,7 @@ import re
 import subprocess
 import sys
 import time
+import threading
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -47,7 +46,7 @@ except ImportError:
     sys.exit(1)
 
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 GITHUB_REPO = "argorar/gradle-guard"
 
 
@@ -61,9 +60,48 @@ class C:
     M = "\033[95m"
     CN = "\033[96m"
     W = "\033[97m"
+    O = "\033[38;5;208m"
     BOLD = "\033[1m"
     DIM = "\033[2m"
     RST = "\033[0m"
+
+
+# ─── Spinner System ─────────────────────────────────────────────────────────────
+
+class Spinner:
+    def __init__(self, message="Loading...", delay=0.1):
+        self.message = message
+        self.delay = delay
+        self.spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self._running = False
+        self._thread = None
+
+    def spin(self):
+        idx = 0
+        while self._running:
+            char = self.spinner_chars[idx % len(self.spinner_chars)]
+            sys.stdout.write(f"\r {C.CN}{char}{C.RST} {self.message}")
+            sys.stdout.flush()
+            idx += 1
+            time.sleep(self.delay)
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self.spin, daemon=True)
+        self._thread.start()
+
+    def stop(self, success=True, custom_msg=None):
+        self._running = False
+        if self._thread:
+            self._thread.join()
+        sys.stdout.write("\r" + " " * (len(self.message) + 15) + "\r")
+        sys.stdout.flush()
+        if custom_msg:
+            print(custom_msg)
+        elif success:
+            print(f" {C.G}✅{C.RST} {self.message}")
+        else:
+            print(f" {C.R}❌{C.RST} {self.message}")
 
 
 # ─── Data Models ────────────────────────────────────────────────────────────────
@@ -136,7 +174,7 @@ def check_for_updates(force_update=False):
     try:
         response = requests.get(url, timeout=10)
         if response.status_code == 404:
-            print(f"{C.Y}⚠ No releases found on GitHub for {GITHUB_REPO} yet.{C.RST}")
+            print(f"{C.Y}No releases found on GitHub for {GITHUB_REPO} yet.{C.RST}")
             return
         response.raise_for_status()
         data = response.json()
@@ -156,7 +194,7 @@ def check_for_updates(force_update=False):
             has_update = latest_ver != current_ver
 
         if not has_update and not force_update:
-            print(f"{C.G}✅ GradleGuard is up to date (v{__version__}).{C.RST}")
+            print(f"{C.G} GradleGuard is up to date (v{__version__}).{C.RST}")
             return
 
         if force_update:
@@ -183,7 +221,7 @@ def check_for_updates(force_update=False):
         with open(script_path, "w", encoding="utf-8") as f:
             f.write(raw_response.text)
 
-        print(f"{C.G}✅ Successfully updated to {latest_tag}! Please run the script again.{C.RST}")
+        print(f"{C.G} Successfully updated to {latest_tag}! Please run the script again.{C.RST}")
         sys.exit(0)
 
     except Exception as e:
@@ -226,7 +264,8 @@ def try_gradle_dependencies(project_path: str) -> list:
         r"(?:\s*->\s*([A-Za-z0-9_.+\-]+))?"
     )
 
-    print(f"{C.DIM}   Running command: {cmd} allDeps -q --no-daemon{C.RST}")
+    spinner = Spinner("Analyzing dependencies with Gradle...")
+    spinner.start()
 
     try:
         result = subprocess.run(
@@ -237,6 +276,8 @@ def try_gradle_dependencies(project_path: str) -> list:
             timeout=180,
             shell=False
         )
+
+        spinner.stop(success=(result.returncode == 0))
 
         deps = {}
         for line in result.stdout.splitlines():
@@ -256,13 +297,14 @@ def try_gradle_dependencies(project_path: str) -> list:
         return list(deps.values())
 
     except Exception as e:
+        spinner.stop(success=False)
         print(f"{C.Y}   ⚠ Gradle execution failed: {e}{C.RST}")
         print("Make sure allDeps is in your main.gradle")
         return []
 
 
 def get_dependencies(project_path: str) -> list:
-    print(f"\n{C.CN}{C.BOLD}📦 Scanning: {project_path}{C.RST}")
+    print(f"\n{C.CN}{C.BOLD} Scanning: {project_path}{C.RST}")
 
     print(f"{C.DIM}   Trying Gradle dependencies task...{C.RST}")
     deps = try_gradle_dependencies(project_path)
@@ -271,7 +313,7 @@ def get_dependencies(project_path: str) -> list:
     managed = [d for d in deps if d.version == "MANAGED"]
 
     if resolved:
-        print(f"{C.G}   ✅ {len(resolved)} dependencies resolved{C.RST}")
+        print(f"{C.G}    {len(resolved)} dependencies resolved{C.RST}")
 
     if managed:
         print(
@@ -509,8 +551,9 @@ def parse_vulns(vuln_list: list, pkg_name: str) -> list:
 
 SEV_COLOR = {
     "CRITICAL": C.R + C.BOLD,
-    "HIGH": C.R,
+    "HIGH": C.O + C.BOLD,
     "MEDIUM": C.Y,
+    "MODERATE": C.Y,
     "LOW": C.B,
     "UNKNOWN": C.DIM,
 }
@@ -519,22 +562,77 @@ SEV_ORDER = {
     "CRITICAL": 0,
     "HIGH": 1,
     "MEDIUM": 2,
+    "MODERATE": 2,
     "LOW": 3,
     "UNKNOWN": 4,
 }
 
 
-def print_report(deps: list):
+def natural_sort_key(s: str):
+    return [int(x) if x.isdigit() else x.lower() for x in re.split(r'(\d+)', s)]
+
+
+def print_report(deps: list, detailed: bool = False):
     affected = [d for d in deps if d.vulnerabilities]
     total_vulns = sum(len(d.vulnerabilities) for d in affected)
 
-    print(f"\n{'═' * 80}")
-    print(f"{C.BOLD}  🛡️  VULNERABILITY SCAN REPORT{C.RST}")
-    print(f"{'═' * 80}")
-    print(f"  Scanned                  : {C.BOLD}{len(deps)}{C.RST}")
-    print(f"  Vulnerable dependencies  : {C.R}{C.BOLD}{len(affected)}{C.RST}")
-    print(f"  Vulns                    : {C.R}{C.BOLD}{total_vulns}{C.RST}")
-    print(f"{'═' * 80}\n")
+    # Calculate severity counts
+    sev_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "UNKNOWN": 0}
+    for d in affected:
+        for v in d.vulnerabilities:
+            s = v.severity.upper()
+            if s == "MODERATE":
+                s = "MEDIUM"
+            if s in sev_counts:
+                sev_counts[s] += 1
+            else:
+                sev_counts["UNKNOWN"] += 1
+
+    box_width = 78
+    title = "🛡️  GRADLE GUARD REPORT SUMMARY"
+    padding_title = (box_width - len(title) - 2) // 2
+    title_line = "│" + " " * padding_title + C.BOLD + C.CN + title + C.RST + " " * (box_width - padding_title - len(title) - 2) + "│"
+    
+    scan_raw = f"Scanned Dependencies : {len(deps)}"
+    vuln_raw = f"Vulnerable Libraries : {len(affected)}"
+    total_raw = f"Total vulnerabilities Found  : {total_vulns}"
+
+    # with ANSI colors
+    scan_line = f"Scanned Dependencies : {C.BOLD}{len(deps)}{C.RST}"
+    vuln_line = f"Vulnerable Libraries : {C.R if affected else C.G}{C.BOLD}{len(affected)}{C.RST}"
+    total_line = f"Total vulnerabilities Found  : {C.R if total_vulns else C.G}{C.BOLD}{total_vulns}{C.RST}"
+    
+    bd_raw = (
+        f"CRITICAL: {sev_counts['CRITICAL']}   "
+        f"HIGH: {sev_counts['HIGH']}   "
+        f"MEDIUM: {sev_counts['MEDIUM']}   "
+        f"LOW: {sev_counts['LOW']}   "
+        f"UNKNOWN: {sev_counts['UNKNOWN']}"
+    )
+    bd_line = (
+        f"{C.R}{C.BOLD}CRITICAL{C.RST}: {sev_counts['CRITICAL']}   "
+        f"{C.O}{C.BOLD}HIGH{C.RST}: {sev_counts['HIGH']}   "
+        f"{C.Y}{C.BOLD}MEDIUM{C.RST}: {sev_counts['MEDIUM']}   "
+        f"{C.B}{C.BOLD}LOW{C.RST}: {sev_counts['LOW']}   "
+        f"{C.DIM}UNKNOWN{C.RST}: {sev_counts['UNKNOWN']}"
+    )
+
+    print(f"\n{C.W}┌{'─' * (box_width - 2)}┐{C.RST}")
+    print(title_line)
+    print(f"{C.W}├{'─' * (box_width - 2)}┤{C.RST}")
+    
+    def print_box_row(content_str, raw_len):
+        extra_len = box_width - 4 - raw_len
+        print(f"{C.W}│{C.RST} {content_str}{' ' * extra_len} {C.W}│{C.RST}")
+
+    severity = "Severity Breakdown:"
+    print_box_row(scan_line, len(scan_raw))
+    print_box_row(vuln_line, len(vuln_raw))
+    print_box_row(total_line, len(total_raw))
+    print_box_row("", 0)
+    print_box_row(severity, len(severity))
+    print_box_row(bd_line, len(bd_raw))
+    print(f"{C.W}└{'─' * (box_width - 2)}┘{C.RST}\n")
 
     if not affected:
         print(f"  {C.G}{C.BOLD}✅ No vulnerabilities found!{C.RST}\n")
@@ -542,44 +640,51 @@ def print_report(deps: list):
 
     affected.sort(
         key=lambda d: min(
-            SEV_ORDER.get(v.severity, 5)
+            SEV_ORDER.get(v.severity.upper(), 5)
             for v in d.vulnerabilities
         )
     )
 
-    for dep in affected:
-        print(f"  {C.BOLD}{C.W}📦 {dep.full_coordinate}{C.RST}")
+    if detailed:
+        for dep in affected:
+            print(f"  {C.BOLD}{C.W}📦 {dep.full_coordinate}{C.RST}")
 
-        if dep.source_file:
-            print(f"     {C.DIM}Source: {dep.source_file}{C.RST}")
+            if dep.source_file:
+                print(f"     {C.DIM}Source: {dep.source_file}{C.RST}")
 
-        dep.vulnerabilities.sort(
-            key=lambda v: SEV_ORDER.get(v.severity, 5)
-        )
-
-        for vuln in dep.vulnerabilities:
-            sc = SEV_COLOR.get(vuln.severity, C.DIM)
-            cves = [a for a in vuln.aliases if a.startswith("CVE-")]
-            cve_str = f" ({', '.join(cves)})" if cves else ""
-
-            print(
-                f"\n     {sc}[{vuln.severity}]{C.RST} "
-                f"{C.BOLD}{vuln.vuln_id}{C.RST}{cve_str}"
+            dep.vulnerabilities.sort(
+                key=lambda v: SEV_ORDER.get(v.severity.upper(), 5)
             )
-            print(f"     {C.DIM}{vuln.summary[:120]}{C.RST}")
 
-            if vuln.fixed_versions:
+            for vuln in dep.vulnerabilities:
+                sc = SEV_COLOR.get(vuln.severity.upper(), C.DIM)
+                cves = [a for a in vuln.aliases if a.startswith("CVE-")]
+                cve_str = f" ({', '.join(cves)})" if cves else ""
+
+                # Standardize Moderate to Medium for console output
+                display_severity = vuln.severity.upper()
+                if display_severity == "MODERATE":
+                    display_severity = "MEDIUM"
+
                 print(
-                    f"     {C.G}✅ Upgrade alternatives: "
-                    f"{C.BOLD}{', '.join(vuln.fixed_versions)}{C.RST}"
+                    f"\n     {sc}[{display_severity}]{C.RST} "
+                    f"{C.BOLD}{vuln.vuln_id}{C.RST}{cve_str}"
                 )
-            else:
-                print(f"     {C.Y}⚠  No fix version available{C.RST}")
+                print(f"     {C.DIM}{vuln.summary[:120]}{C.RST}")
 
-            for ref in vuln.references:
-                print(f"     {C.DIM}  • {ref}{C.RST}")
+                if vuln.fixed_versions:
+                    sorted_fixed = sorted(list(vuln.fixed_versions), key=natural_sort_key)
+                    print(
+                        f"     {C.G} Upgrade alternatives: "
+                        f"{C.BOLD}{', '.join(sorted_fixed)}{C.RST}"
+                    )
+                else:
+                    print(f"     {C.Y}⚠  No fix version available{C.RST}")
 
-        print(f"\n  {'─' * 76}\n")
+                for ref in vuln.references:
+                    print(f"     {C.DIM}  • {ref}{C.RST}")
+
+            print(f"\n  {'─' * 76}\n")
 
     # Upgrade summary table
     upgrades = {}
@@ -601,27 +706,42 @@ def print_report(deps: list):
 
     if upgrades:
         print(f"\n{C.BOLD}{C.CN}  📋 RECOMMENDED UPGRADES{C.RST}")
-        print(f"  {'─' * 120}")
+        
+        # Calculate dynamic third column width based on the longest versions list
+        max_alt_len = 20  # minimum width
+        for lib, info in upgrades.items():
+            fixed_versions = sorted(list(info["fixed_versions"]), key=natural_sort_key)
+            alternatives_str = ", ".join(fixed_versions)
+            if len(alternatives_str) > max_alt_len:
+                max_alt_len = len(alternatives_str)
+        col3_width = max_alt_len + 2
+
+        # Table Header with box-drawing characters
+        print(f"  ┌{'─' * 45}┬{'─' * 14}┬{'─' * col3_width}┐")
         print(
-            f"  {'Library':<45} "
-            f"{'Current':<14} "
-            f"{'Upgrade Alternatives':<40} "
+            f"  │ {'Library':<43} │ "
+            f"{'Current':<12} │ "
+            f"{'Upgrade Alternatives':<{col3_width - 2}} │"
         )
-        print(f"  {'─' * 120}")
+        print(f"  ├{'─' * 45}┼{'─' * 14}┼{'─' * col3_width}┤")
 
         for lib, info in sorted(upgrades.items()):
             current = info["current"]
-            fixed_versions = sorted(info["fixed_versions"])
+            fixed_versions = sorted(list(info["fixed_versions"]), key=natural_sort_key)
+            alternatives_str = ", ".join(fixed_versions)
 
-            alternatives = ", ".join(fixed_versions)
+            # Pad values safely BEFORE wrapping in ANSI codes
+            lib_padded = f"{lib:<43}"
+            current_padded = f"{current:<12}"
+            alternatives_padded = f"{alternatives_str:<{col3_width - 2}}"
 
             print(
-                f"  {lib:<45} "
-                f"{C.R}{current:<14}{C.RST} "
-                f"{C.G}{C.BOLD}{alternatives:<40}{C.RST} "
+                f"  │ {C.W}{lib_padded}{C.RST} │ "
+                f"{C.R}{current_padded}{C.RST} │ "
+                f"{C.G}{C.BOLD}{alternatives_padded}{C.RST} │"
             )
 
-        print(f"  {'─' * 120}\n")
+        print(f"  └{'─' * 45}┴{'─' * 14}┴{'─' * col3_width}┘\n")
 
 
 def export_json(deps: list, path: str):
@@ -638,7 +758,7 @@ def export_json(deps: list, path: str):
                     {
                         "id": v.vuln_id,
                         "aliases": v.aliases,
-                        "severity": v.severity,
+                        "severity": v.severity.upper() if v.severity.upper() != "MODERATE" else "MEDIUM",
                         "summary": v.summary,
                         "fixed_versions": v.fixed_versions,
                     }
@@ -652,7 +772,7 @@ def export_json(deps: list, path: str):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
-    print(f"  {C.CN}📄 JSON report: {path}{C.RST}")
+    print(f"  {C.CN} JSON report: {path}{C.RST}")
 
 # ─── Main ───────────────────────────────────────────────────────────────────────
 
@@ -671,6 +791,11 @@ def main():
         help="Export JSON report.",
     )
     parser.add_argument(
+        "--detailed", "-d",
+        action="store_true",
+        help="Print detailed vulnerability information for each package.",
+    )
+    parser.add_argument(
         "--update",
         action="store_true",
         help="Check for updates and self-update the script.",
@@ -686,7 +811,7 @@ def main():
     load_cache()
 
     if args.update:
-        check_for_updates()
+        check_for_updates(force_update=True)
         sys.exit(0)
 
     if not args.project_path:
@@ -722,7 +847,7 @@ def main():
         save_cache()
         sys.exit(1)
 
-    print(f"\n{C.CN}{C.BOLD}🔍 Querying OSV API...{C.RST}")
+    print(f"\n{C.CN}{C.BOLD} Querying OSV API...{C.RST}")
     vuln_results = query_osv_batch(deps)
 
     for dep in deps:
@@ -731,10 +856,10 @@ def main():
             dep.vulnerabilities = parse_vulns(raw, dep.coordinate)
 
     vc = sum(1 for d in deps if d.vulnerabilities)
-    print(f"{C.G}   ✅ Done. {vc} vulnerable dependencies identified.{C.RST}")
+    print(f"{C.G}    Done. {vc} vulnerable dependencies identified.{C.RST}")
 
     # Output Reports
-    print_report(deps)
+    print_report(deps, detailed=args.detailed)
 
     if args.json:
         export_json(deps, args.json)
