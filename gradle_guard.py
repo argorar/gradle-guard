@@ -133,6 +133,13 @@ class Dependency:
         return f"{self.group}:{self.artifact}:{self.version}"
 
 
+@dataclass
+class DependencyTreeNode:
+    label: str
+    dependency: Optional[Dependency] = None
+    children: list = field(default_factory=list)
+
+
 # ─── Cache System ─────────────────────────────────────────────────────────────
 
 CACHE_PATH = os.path.expanduser("~/.gradle_guard_cache.json")
@@ -242,7 +249,81 @@ def print_progress(current: int, total: int, prefix: str = "", suffix: str = "")
         sys.stdout.write("\n")
         sys.stdout.flush()
 
-def try_gradle_dependencies(project_path: str) -> list:
+def parse_gradle_dependency_output(output: str) -> tuple:
+    dep_pattern = re.compile(
+        r"(?:[|\\+`\-\s]+)?"
+        r"([A-Za-z0-9_.\-]+):"
+        r"([A-Za-z0-9_.\-]+):"
+        r"([A-Za-z0-9_.+\-]+)"
+        r"(?:\s*->\s*([A-Za-z0-9_.+\-]+))?"
+    )
+    tree_pattern = re.compile(r"^([| ]*)(?:\\---|\+---)\s+(.+)$")
+    configuration_pattern = re.compile(r"^([A-Za-z][A-Za-z0-9_.-]*)\s+-\s+(.+)$")
+
+    deps = {}
+    tree_roots = []
+    current_config = None
+    stack = []
+
+    for line in output.splitlines():
+        config_match = configuration_pattern.match(line)
+        if config_match:
+            current_config = DependencyTreeNode(
+                label=config_match.group(1),
+                children=[],
+            )
+            stack = []
+            continue
+
+        tree_match = tree_pattern.match(line)
+        m = dep_pattern.search(line)
+        if m:
+            g, a = m.group(1), m.group(2)
+            v = m.group(4) or m.group(3)
+            key = f"{g}:{a}:{v}"
+            if key not in deps:
+                deps[key] = Dependency(
+                    group=g,
+                    artifact=a,
+                    version=v,
+                    source_file="gradle-resolved"
+                )
+
+            if tree_match:
+                if current_config is None:
+                    current_config = DependencyTreeNode(
+                        label="dependencies",
+                        children=[],
+                    )
+
+                if current_config not in tree_roots:
+                    tree_roots.append(current_config)
+
+                level = len(tree_match.group(1)) // 5
+                node = DependencyTreeNode(
+                    label=deps[key].full_coordinate,
+                    dependency=deps[key],
+                )
+
+                if level == 0:
+                    current_config.children.append(node)
+                else:
+                    parent = stack[level - 1] if level - 1 < len(stack) else None
+                    if parent:
+                        parent.children.append(node)
+                    else:
+                        current_config.children.append(node)
+
+                if level < len(stack):
+                    stack[level] = node
+                else:
+                    stack.append(node)
+                del stack[level + 1:]
+
+    return list(deps.values()), tree_roots
+
+
+def try_gradle_dependencies(project_path: str) -> tuple:
     is_windows = os.name == "nt"
 
     gradlew_unix = os.path.join(project_path, "gradlew")
@@ -255,14 +336,6 @@ def try_gradle_dependencies(project_path: str) -> list:
         os.chmod(gradlew_unix, 0o755)
     else:
         cmd = "gradle"
-
-    dep_pattern = re.compile(
-        r"(?:[|\\+`\-\s]+)?"
-        r"([A-Za-z0-9_.\-]+):"
-        r"([A-Za-z0-9_.\-]+):"
-        r"([A-Za-z0-9_.+\-]+)"
-        r"(?:\s*->\s*([A-Za-z0-9_.+\-]+))?"
-    )
 
     spinner = Spinner("Analyzing dependencies with Gradle...")
     spinner.start()
@@ -278,36 +351,20 @@ def try_gradle_dependencies(project_path: str) -> list:
         )
 
         spinner.stop(success=(result.returncode == 0))
-
-        deps = {}
-        for line in result.stdout.splitlines():
-            m = dep_pattern.search(line)
-            if m:
-                g, a = m.group(1), m.group(2)
-                v = m.group(4) or m.group(3)
-                key = f"{g}:{a}:{v}"
-                if key not in deps:
-                    deps[key] = Dependency(
-                        group=g,
-                        artifact=a,
-                        version=v,
-                        source_file="gradle-resolved"
-                    )
-
-        return list(deps.values())
+        return parse_gradle_dependency_output(result.stdout)
 
     except Exception as e:
         spinner.stop(success=False)
         print(f"{C.Y}   ⚠ Gradle execution failed: {e}{C.RST}")
         print("Make sure allDeps is in your main.gradle")
-        return []
+        return [], []
 
 
-def get_dependencies(project_path: str) -> list:
+def get_dependencies(project_path: str) -> tuple:
     print(f"\n{C.CN}{C.BOLD} Scanning: {project_path}{C.RST}")
 
     print(f"{C.DIM}   Trying Gradle dependencies task...{C.RST}")
-    deps = try_gradle_dependencies(project_path)
+    deps, tree_roots = try_gradle_dependencies(project_path)
 
     resolved = [d for d in deps if d.version != "MANAGED"]
     managed = [d for d in deps if d.version == "MANAGED"]
@@ -326,7 +383,7 @@ def get_dependencies(project_path: str) -> list:
     if not resolved:
         print(f"{C.R}   ❌ No dependencies found with resolvable versions.{C.RST}")
 
-    return resolved
+    return resolved, tree_roots
 
 
 # ─── OSV Vulnerability Queries ──────────────────────────────────────────────────
@@ -572,6 +629,156 @@ def natural_sort_key(s: str):
     return [int(x) if x.isdigit() else x.lower() for x in re.split(r'(\d+)', s)]
 
 
+def display_severity(severity: str) -> str:
+    severity = severity.upper()
+    return "MEDIUM" if severity == "MODERATE" else severity
+
+
+def tree_has_vulnerabilities(node: DependencyTreeNode) -> bool:
+    if node.dependency and node.dependency.vulnerabilities:
+        return True
+
+    return any(tree_has_vulnerabilities(child) for child in node.children)
+
+
+def tree_vulnerable_coordinates(node: DependencyTreeNode) -> set:
+    coordinates = set()
+
+    if node.dependency and node.dependency.vulnerabilities:
+        coordinates.add(node.dependency.full_coordinate)
+
+    for child in node.children:
+        coordinates.update(tree_vulnerable_coordinates(child))
+
+    return coordinates
+
+
+def tree_signature(node: DependencyTreeNode):
+    if node.dependency:
+        label = node.dependency.full_coordinate
+    else:
+        label = "configuration"
+
+    return (
+        label,
+        tuple(tree_signature(child) for child in node.children),
+    )
+
+
+def select_tree_roots(tree_roots: list, include_all: bool = False) -> list:
+    if include_all:
+        return tree_roots
+
+    classpath_priority = {
+        "runtimeClasspath": 0,
+        "compileClasspath": 1,
+        "testRuntimeClasspath": 2,
+        "testCompileClasspath": 3,
+    }
+    classpath_roots = [
+        root
+        for root in tree_roots
+        if root.children and root.label in classpath_priority
+    ]
+    roots_with_vulns = [
+        root
+        for root in classpath_roots
+        if tree_has_vulnerabilities(root)
+    ]
+    selected = roots_with_vulns or classpath_roots
+
+    covered_vulnerabilities = set()
+    for root in selected:
+        covered_vulnerabilities.update(tree_vulnerable_coordinates(root))
+
+    for root in tree_roots:
+        if not root.children or root in selected:
+            continue
+
+        vulnerable_coordinates = tree_vulnerable_coordinates(root)
+        if vulnerable_coordinates - covered_vulnerabilities:
+            selected.append(root)
+            covered_vulnerabilities.update(vulnerable_coordinates)
+
+    if not selected:
+        selected = [root for root in tree_roots if root.children]
+
+    selected.sort(
+        key=lambda root: (
+            classpath_priority.get(root.label, 99),
+            root.label,
+        )
+    )
+
+    deduped = []
+    seen_signatures = set()
+    for root in selected:
+        signature = tree_signature(root)
+        if signature in seen_signatures:
+            continue
+
+        seen_signatures.add(signature)
+        deduped.append(root)
+
+    return deduped
+
+
+def print_vulnerability_tree(tree_roots: list, include_all: bool = False):
+    print(f"\n{C.BOLD}{C.CN}  Gradle transitive dependency tree{C.RST}")
+
+    visible_roots = select_tree_roots(tree_roots, include_all=include_all)
+
+    if not visible_roots:
+        print(f"  {C.Y}No Gradle dependency tree was captured.{C.RST}\n")
+        return
+
+    def vulnerability_badge(dep: Dependency) -> str:
+        if not dep.vulnerabilities:
+            return ""
+
+        dep.vulnerabilities.sort(
+            key=lambda v: (
+                SEV_ORDER.get(v.severity.upper(), 5),
+                v.vuln_id,
+            )
+        )
+        worst_severity = display_severity(dep.vulnerabilities[0].severity)
+        worst_color = SEV_COLOR.get(worst_severity, C.DIM)
+        vuln_label = "vuln" if len(dep.vulnerabilities) == 1 else "vulns"
+        return (
+            f" {worst_color}[{worst_severity}]{C.RST}"
+            f" {C.DIM}{len(dep.vulnerabilities)} {vuln_label}{C.RST}"
+        )
+
+    def print_node(node: DependencyTreeNode, prefix: str, is_last: bool):
+        branch = "└──" if is_last else "├──"
+
+        if node.dependency:
+            dep = node.dependency
+            color = C.BOLD + C.W if dep.vulnerabilities else C.W
+            label = dep.full_coordinate
+            suffix = vulnerability_badge(dep)
+        else:
+            color = C.BOLD + C.CN
+            label = node.label
+            suffix = ""
+
+        print(f"  {C.W}{prefix}{branch}{C.RST} {color}{label}{C.RST}{suffix}")
+
+        child_prefix = prefix + ("    " if is_last else "│   ")
+        for child_index, child in enumerate(node.children):
+            print_node(
+                child,
+                child_prefix,
+                child_index == len(node.children) - 1,
+            )
+
+    for root_index, root in enumerate(visible_roots):
+        print_node(root, "", root_index == len(visible_roots) - 1)
+
+    print()
+
+
 def print_report(deps: list, detailed: bool = False):
     affected = [d for d in deps if d.vulnerabilities]
     total_vulns = sum(len(d.vulnerabilities) for d in affected)
@@ -662,12 +869,10 @@ def print_report(deps: list, detailed: bool = False):
                 cve_str = f" ({', '.join(cves)})" if cves else ""
 
                 # Standardize Moderate to Medium for console output
-                display_severity = vuln.severity.upper()
-                if display_severity == "MODERATE":
-                    display_severity = "MEDIUM"
+                severity_label = display_severity(vuln.severity)
 
                 print(
-                    f"\n     {sc}[{display_severity}]{C.RST} "
+                    f"\n     {sc}[{severity_label}]{C.RST} "
                     f"{C.BOLD}{vuln.vuln_id}{C.RST}{cve_str}"
                 )
                 print(f"     {C.DIM}{vuln.summary[:120]}{C.RST}")
@@ -796,6 +1001,16 @@ def main():
         help="Print detailed vulnerability information for each package.",
     )
     parser.add_argument(
+        "--tree",
+        action="store_true",
+        help="Print Gradle's transitive dependency tree and highlight vulnerable nodes.",
+    )
+    parser.add_argument(
+        "--tree-all-configs",
+        action="store_true",
+        help="Print every Gradle configuration in the dependency tree.",
+    )
+    parser.add_argument(
         "--update",
         action="store_true",
         help="Check for updates and self-update the script.",
@@ -841,7 +1056,7 @@ def main():
         print(f"{C.R}❌ No Gradle build files in: {project_path}{C.RST}")
         sys.exit(1)
 
-    deps = get_dependencies(project_path)
+    deps, tree_roots = get_dependencies(project_path)
 
     if not deps:
         save_cache()
@@ -860,6 +1075,9 @@ def main():
 
     # Output Reports
     print_report(deps, detailed=args.detailed)
+
+    if args.tree or args.tree_all_configs:
+        print_vulnerability_tree(tree_roots, include_all=args.tree_all_configs)
 
     if args.json:
         export_json(deps, args.json)
