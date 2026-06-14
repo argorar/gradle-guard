@@ -46,7 +46,7 @@ except ImportError:
     sys.exit(1)
 
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 GITHUB_REPO = "argorar/gradle-guard"
 
 
@@ -170,11 +170,35 @@ def save_cache():
         pass
 
 
+def find_release_python_asset(release_data: dict) -> Optional[dict]:
+    assets = release_data.get("assets", [])
+    if not assets:
+        return None
+
+    exact_names = {
+        "gradle-guard.py"
+    }
+    for asset in assets:
+        if asset.get("name") in exact_names and asset.get("browser_download_url"):
+            return asset
+
+    python_assets = [
+        asset
+        for asset in assets
+        if asset.get("name", "").endswith(".py")
+        and asset.get("browser_download_url")
+    ]
+    if len(python_assets) == 1:
+        return python_assets[0]
+
+    return None
+
+
 def check_for_updates(force_update=False):
     """
     Checks GitHub for the latest release.
     If a new version is found (or if force_update is True), prompts the user
-    to update and downloads/overwrites the current script.
+    to update and downloads/overwrites the current script from the release asset.
     """
     print(f"{C.CN}🔄 Checking for updates...{C.RST}")
     url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -215,18 +239,24 @@ def check_for_updates(force_update=False):
             print("Update cancelled.")
             return
 
-        # Perform update
-        raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{latest_tag}/gradle_guard.py"
-        print(f"Downloading update from {raw_url}...")
-        raw_response = requests.get(raw_url, timeout=15)
-        raw_response.raise_for_status()
+        asset = find_release_python_asset(data)
+        if not asset:
+            print(
+                f"{C.R}❌ No Python release asset found for {latest_tag}.{C.RST}\n"
+            )
+            return
+
+        download_url = asset["browser_download_url"]
+        print(f"Downloading {asset['name']} from {download_url}...")
+        asset_response = requests.get(download_url, timeout=30)
+        asset_response.raise_for_status()
 
         script_path = os.path.abspath(__file__)
         print(f"Overwriting {script_path}...")
         
         # Write new content
         with open(script_path, "w", encoding="utf-8") as f:
-            f.write(raw_response.text)
+            f.write(asset_response.text)
 
         print(f"{C.G} Successfully updated to {latest_tag}! Please run the script again.{C.RST}")
         sys.exit(0)

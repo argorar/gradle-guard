@@ -37,6 +37,7 @@
 - **✅ Upgrade recommendations** — Shows all available fix versions per vulnerability.
 - **📄 JSON export** — Machine-readable reports for CI/CD pipelines and dashboards.
 - **🎨 Rich terminal output** — Color-coded, human-friendly reports with CVE cross-references.
+- **🌳 Gradle dependency tree** — Optional ANSI tree preserving parent-child transitive paths and highlighting vulnerable nodes.
 - **🪟 Cross-platform** — Works on Windows, macOS, and Linux.
 
 ## Installation
@@ -81,6 +82,14 @@ python gradle_guard.py C:\Users\me\projects\my-spring-app
 ```bash
 python gradle_guard.py ~/projects/my-spring-app --json report.json
 ```
+
+### Print Gradle Dependency Tree With Vulnerabilities
+
+```bash
+python gradle_guard.py ~/projects/my-spring-app --tree
+```
+
+Use `--tree-all-configs` to print every Gradle configuration instead of the deduplicated tree.
 
 ### Example Output
 
