@@ -165,16 +165,16 @@ The `--json` flag produces a structured report suitable for dashboards, CI gates
 ## How It Works
 
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌──────────────┐
+┌──────────────────┐     ┌──────────────────┐     ┌──────────────┐
 │  Gradle Project  │────▶│  ./gradlew       │────▶│  Dependency  │
 │  (your code)     │     │  allDeps -q      │     │  Tree        │
-└─────────────────┘     └──────────────────┘     └──────┬───────┘
-                                                        │
-                                                        ▼
-┌─────────────────┐     ┌──────────────────┐     ┌──────────────┐
+└──────────────────┘     └──────────────────┘     └──────┬───────┘
+                                                         │
+                                                         ▼
+┌──────────────────┐     ┌──────────────────┐     ┌──────────────┐
 │  Terminal Report │◀────│  Parse & Match   │◀────│  OSV.dev API │
 │  + JSON Export   │     │  Vulnerabilities │     │  (batch)     │
-└─────────────────┘     └──────────────────┘     └──────────────┘
+└──────────────────┘     └──────────────────┘     └──────────────┘
 ```
 
 1. **Discover** — Locates `build.gradle`, `build.gradle.kts`, or `main.gradle` files.

@@ -46,7 +46,7 @@ except ImportError:
     sys.exit(1)
 
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 GITHUB_REPO = "argorar/gradle-guard"
 
 
@@ -683,6 +683,25 @@ def tree_vulnerable_coordinates(node: DependencyTreeNode) -> set:
     return coordinates
 
 
+def prune_tree_to_vulnerable_paths(node: DependencyTreeNode) -> Optional[DependencyTreeNode]:
+    pruned_children = []
+    for child in node.children:
+        pruned_child = prune_tree_to_vulnerable_paths(child)
+        if pruned_child:
+            pruned_children.append(pruned_child)
+
+    if not pruned_children and not (
+        node.dependency and node.dependency.vulnerabilities
+    ):
+        return None
+
+    return DependencyTreeNode(
+        label=node.label,
+        dependency=node.dependency,
+        children=pruned_children,
+    )
+
+
 def tree_signature(node: DependencyTreeNode):
     if node.dependency:
         label = node.dependency.full_coordinate
@@ -754,12 +773,27 @@ def select_tree_roots(tree_roots: list, include_all: bool = False) -> list:
 
 
 def print_vulnerability_tree(tree_roots: list, include_all: bool = False):
-    print(f"\n{C.BOLD}{C.CN}  Gradle transitive dependency tree{C.RST}")
+    print(f"\n{C.BOLD}{C.CN}  Gradle transitive dependency tree with vulnerabilities{C.RST}")
 
-    visible_roots = select_tree_roots(tree_roots, include_all=include_all)
+    visible_roots = []
+    seen_pruned_signatures = set()
+    for root in select_tree_roots(tree_roots, include_all=include_all):
+        pruned_root = prune_tree_to_vulnerable_paths(root)
+        if not pruned_root:
+            continue
+
+        pruned_signature = tree_signature(pruned_root)
+        if pruned_signature in seen_pruned_signatures:
+            continue
+
+        seen_pruned_signatures.add(pruned_signature)
+        visible_roots.append(pruned_root)
 
     if not visible_roots:
-        print(f"  {C.Y}No Gradle dependency tree was captured.{C.RST}\n")
+        if tree_roots:
+            print(f"  {C.G}No vulnerable dependency paths found in the Gradle tree.{C.RST}\n")
+        else:
+            print(f"  {C.Y}No Gradle dependency tree was captured.{C.RST}\n")
         return
 
     def vulnerability_badge(dep: Dependency) -> str:
@@ -1033,12 +1067,12 @@ def main():
     parser.add_argument(
         "--tree",
         action="store_true",
-        help="Print Gradle's transitive dependency tree and highlight vulnerable nodes.",
+        help="Print only Gradle dependency paths that contain vulnerable nodes.",
     )
     parser.add_argument(
         "--tree-all-configs",
         action="store_true",
-        help="Print every Gradle configuration in the dependency tree.",
+        help="Search every Gradle configuration when printing vulnerable dependency paths.",
     )
     parser.add_argument(
         "--update",
