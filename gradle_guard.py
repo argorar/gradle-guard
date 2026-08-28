@@ -46,7 +46,7 @@ except ImportError:
     sys.exit(1)
 
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 GITHUB_REPO = "argorar/gradle-guard"
 
 
@@ -380,7 +380,13 @@ def try_gradle_dependencies(project_path: str) -> tuple:
             shell=False
         )
 
-        spinner.stop(success=(result.returncode == 0))
+        if result.returncode != 0:
+            spinner.stop(success=False)
+            print(f"{C.R}   ❌ Gradle failed:{C.RST}")
+            print(result.stderr.strip() or result.stdout.strip())
+            return [], []
+
+        spinner.stop(success=True)
         return parse_gradle_dependency_output(result.stdout)
 
     except Exception as e:
