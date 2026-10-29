@@ -46,7 +46,7 @@ except ImportError:
     sys.exit(1)
 
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 GITHUB_REPO = "argorar/gradle-guard"
 
 
@@ -80,7 +80,7 @@ class Spinner:
         idx = 0
         while self._running:
             char = self.spinner_chars[idx % len(self.spinner_chars)]
-            sys.stdout.write(f"\r {C.CN}{char}{C.RST} {self.message}")
+            sys.stdout.write(f"\r {C.CN}{char}{C.RST} {self.message}\033[K")
             sys.stdout.flush()
             idx += 1
             time.sleep(self.delay)
@@ -94,7 +94,7 @@ class Spinner:
         self._running = False
         if self._thread:
             self._thread.join()
-        sys.stdout.write("\r" + " " * (len(self.message) + 15) + "\r")
+        sys.stdout.write(f"\r{' ' * (len(self.message) + 20)}\r")
         sys.stdout.flush()
         if custom_msg:
             print(custom_msg)
@@ -280,6 +280,7 @@ def print_progress(current: int, total: int, prefix: str = "", suffix: str = "")
         sys.stdout.flush()
 
 def parse_gradle_dependency_output(output: str) -> tuple:
+    ansi_escape = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
     dep_pattern = re.compile(
         r"(?:[|\\+`\-\s]+)?"
         r"([A-Za-z0-9_.\-]+):"
@@ -295,7 +296,8 @@ def parse_gradle_dependency_output(output: str) -> tuple:
     current_config = None
     stack = []
 
-    for line in output.splitlines():
+    for raw_line in output.splitlines():
+        line = ansi_escape.sub("", raw_line).rstrip()
         config_match = configuration_pattern.match(line)
         if config_match:
             current_config = DependencyTreeNode(
@@ -306,7 +308,7 @@ def parse_gradle_dependency_output(output: str) -> tuple:
             continue
 
         tree_match = tree_pattern.match(line)
-        m = dep_pattern.search(line)
+        m = dep_pattern.search(line) if tree_match else None
         if m:
             g, a = m.group(1), m.group(2)
             v = m.group(4) or m.group(3)
@@ -367,29 +369,51 @@ def try_gradle_dependencies(project_path: str) -> tuple:
     else:
         cmd = "gradle"
 
-    spinner = Spinner("Analyzing dependencies with Gradle...")
+    base_msg = "Analyzing dependencies with Gradle..."
+    spinner = Spinner(base_msg)
     spinner.start()
+    proc = None
 
     try:
-        result = subprocess.run(
-            [cmd, "allDeps", "-q", "--no-daemon"],
-            capture_output=True,
-            text=True,
+        proc = subprocess.Popen(
+            [cmd, "allDeps", "--console=rich", "--no-daemon"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             cwd=project_path,
-            timeout=180,
-            shell=False
+            shell=False,
         )
+        chunks = []
+        prog_re = re.compile(r"\d+%\s+[A-Z]+")
 
-        if result.returncode != 0:
+        def _read_stream():
+            for raw in iter(lambda: proc.stdout.read1(4096), b""):
+                text = raw.decode("utf-8", errors="replace")
+                chunks.append(text)
+                matches = prog_re.findall(text)
+                if matches:
+                    spinner.message = f"{base_msg} {C.DIM}[{matches[-1]}]{C.RST}"
+
+        reader = threading.Thread(target=_read_stream, daemon=True)
+        reader.start()
+        proc.wait(timeout=180)
+        reader.join(timeout=2)
+        output = "".join(chunks)
+        spinner.message = base_msg
+
+        if proc.returncode != 0:
             spinner.stop(success=False)
             print(f"{C.R}   ❌ Gradle failed:{C.RST}")
-            print(result.stderr.strip() or result.stdout.strip())
+            print(output.strip())
             return [], []
 
         spinner.stop(success=True)
-        return parse_gradle_dependency_output(result.stdout)
+        return parse_gradle_dependency_output(output)
 
     except Exception as e:
+        if proc and proc.poll() is None:
+            proc.kill()
+        spinner.message = base_msg
         spinner.stop(success=False)
         print(f"{C.Y}   ⚠ Gradle execution failed: {e}{C.RST}")
         print("Make sure allDeps is in your main.gradle")
