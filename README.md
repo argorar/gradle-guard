@@ -54,7 +54,7 @@
 
 ```bash
 # 1. Clone
-git clone https://github.com/argorar/gradle_guard.git
+git clone https://github.com/argorar/gradle-guard.git
 
 # 2. (Optional) Create a virtual environment
 python -m venv .venv
